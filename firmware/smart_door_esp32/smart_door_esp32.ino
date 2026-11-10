@@ -1,6 +1,5 @@
 /*
- * Smart Door Access Control & Real-Time Logging System — firmware node ESP32
- * Terhubung ke cloud milik sendiri (Smart Door Cloud, Laravel) melalui REST API HTTP(S) + JSON.
+ * Smart Door Access Control & Real-Time Logging System — firmware node ESP32.
  *
  * Library (Library Manager):
  *   - MFRC522 by GithubCommunity (miguelbalboa)
@@ -47,8 +46,8 @@ struct CmdMsg { int32_t id; char type[16]; };
 struct AckMsg { int32_t id; bool ok; char detail[40]; };
 
 // ------------------------------------------------------------------ global
-MFRC522 rfidIn(PIN_SS_IN, PIN_RST);
-MFRC522 rfidOut(PIN_SS_OUT, PIN_RST);
+MFRC522 rfidIn(PIN_SS_IN, PIN_RST_IN);
+MFRC522 rfidOut(PIN_SS_OUT, PIN_RST_OUT);
 Preferences prefs;
 
 SemaphoreHandle_t mux;           // melindungi state, cfg, whitelist
@@ -86,25 +85,41 @@ void setRelay(bool on) {
 }
 void setLed(int pin, bool on) { if (pin >= 0) digitalWrite(pin, on ? HIGH : LOW); }
 
-// Buzzer non-blocking: pola ON/OFF (ms). Saat alarm aktif, buzzer berbunyi putus-putus terus.
+// Buzzer PASIF non-blocking: pola ON/OFF (ms) dengan nada tertentu. Saat alarm aktif, berbunyi sirene terus.
 const uint16_t BEEP_OK[]   = {120, 100, 120};           // 2x singkat: akses diterima
-const uint16_t BEEP_DENY[] = {600, 200, 600, 200, 600}; // 3x panjang: akses ditolak
-const uint16_t* beepPat = nullptr; uint8_t beepLen = 0, beepIdx = 0; unsigned long beepT = 0;
-void beep(const uint16_t* p, uint8_t n) { beepPat = p; beepLen = n; beepIdx = 0; beepT = millis(); digitalWrite(PIN_BUZZER, HIGH); lock(); st.buzzer = true; unlock_(); markDirty(); }
+const uint16_t BEEP_DENY[] = {500, 200, 500, 200, 500}; // 3x panjang: akses ditolak
+const uint16_t* beepPat = nullptr; uint8_t beepLen = 0, beepIdx = 0; unsigned long beepT = 0; uint16_t beepFreq = 0;
+
+// Mengubah nada hanya jika berbeda, supaya tone() tidak dipanggil ulang setiap putaran loop.
+void buzzerSet(uint16_t freq) {
+  static uint16_t current = 0;
+  if (PIN_BUZZER < 0 || freq == current) return;
+  current = freq;
+  if (freq) tone(PIN_BUZZER, freq);
+  else { noTone(PIN_BUZZER); digitalWrite(PIN_BUZZER, LOW); }
+}
+
+void beep(const uint16_t* p, uint8_t n, uint16_t freq) {
+  if (PIN_BUZZER < 0) return;
+  beepPat = p; beepLen = n; beepIdx = 0; beepT = millis(); beepFreq = freq;
+  buzzerSet(freq);
+  lock(); st.buzzer = true; unlock_(); markDirty();
+}
 void serviceBuzzer(bool alarmOn) {
+  if (PIN_BUZZER < 0) return;
   static bool lastActive = false;
   bool active;
   if (alarmOn) {
-    digitalWrite(PIN_BUZZER, (millis() / 300) % 2 ? HIGH : LOW);
+    buzzerSet((millis() / 300) % 2 ? BUZZER_FREQ_ALARM_HI : BUZZER_FREQ_ALARM_LO);
     active = true;
   } else if (beepPat) {
     if (millis() - beepT >= beepPat[beepIdx]) {
       beepIdx++; beepT = millis();
-      if (beepIdx >= beepLen) { beepPat = nullptr; digitalWrite(PIN_BUZZER, LOW); }
-      else digitalWrite(PIN_BUZZER, (beepIdx % 2 == 0) ? HIGH : LOW);
+      if (beepIdx >= beepLen) beepPat = nullptr;
     }
+    buzzerSet(beepPat && beepIdx % 2 == 0 ? beepFreq : 0);
     active = beepPat != nullptr;
-  } else { digitalWrite(PIN_BUZZER, LOW); active = false; }
+  } else { buzzerSet(0); active = false; }
   if (active != lastActive) { lastActive = active; lock(); st.buzzer = active; unlock_(); markDirty(); }
 }
 
@@ -135,7 +150,7 @@ void grantAccess(const char* dir, const char* uid) {
   grantedUntil = millis() + ms;
   setRelay(true);
   setLed(PIN_LED_GREEN, true); lock(); st.ledGreen = true; unlock_();
-  beep(BEEP_OK, 3);
+  beep(BEEP_OK, 3, BUZZER_FREQ_OK);
 }
 
 void endUnlockWindow() {
@@ -167,7 +182,7 @@ void handleCard(MFRC522& reader, const char* dir) {
   } else {
     lock(); st.failCount++; uint8_t f = st.failCount; unlock_(); markDirty();
     pushEvent("ACCESS", "DITOLAK", dir, uid.c_str());
-    beep(BEEP_DENY, 5);
+    beep(BEEP_DENY, 5, BUZZER_FREQ_DENY);
     setLed(PIN_LED_RED, true); ledRedUntil = millis() + 2000; lock(); st.ledRed = true; unlock_();
     if (f >= cfg.maxFail) {
       blockedUntil = millis() + cfg.blockS * 1000UL;
@@ -179,31 +194,32 @@ void handleCard(MFRC522& reader, const char* dir) {
 }
 
 void serviceDoor() {
-  // debounce reed switch 50 ms
-  static bool stable = digitalRead(PIN_REED) == HIGH; static bool lastRaw = stable; static unsigned long changedAt = 0;
-  bool raw = digitalRead(PIN_REED) == HIGH;
-  if (raw != lastRaw) { lastRaw = raw; changedAt = millis(); }
-  if (millis() - changedAt > 50 && raw != stable) {
-    stable = raw;
-    lock(); st.doorOpen = stable; unlock_(); markDirty();
-    if (stable) {                                  // ---- pintu DIBUKA
-      doorOpenedAt = millis(); leftOpenAlarmed = false;
-      pushEvent("DOOR", "OPEN");
-      if (authorizedPending) {
-        authorizedPending = false;
-        endUnlockWindow();                        // solenoid langsung dimatikan
-        lock();
-        if (!strcmp(pendingDir, "MASUK")) st.occupancy++;
-        else if (!strcmp(pendingDir, "KELUAR") && st.occupancy > 0) st.occupancy--;
-        int occ = st.occupancy; unlock_();
-        prefs.putInt("occ", occ);
+  static bool stable = false, lastRaw = false; static unsigned long changedAt = 0;
+  if (PIN_REED >= 0) {
+    bool raw = digitalRead(PIN_REED) == HIGH;
+    if (raw != lastRaw) { lastRaw = raw; changedAt = millis(); }
+    if (millis() - changedAt > 50 && raw != stable) {
+      stable = raw;
+      lock(); st.doorOpen = stable; unlock_(); markDirty();
+      if (stable) {
+        doorOpenedAt = millis(); leftOpenAlarmed = false;
+        pushEvent("DOOR", "OPEN");
+        if (authorizedPending) {
+          authorizedPending = false;
+          endUnlockWindow();
+          lock();
+          if (!strcmp(pendingDir, "MASUK")) st.occupancy++;
+          else if (!strcmp(pendingDir, "KELUAR") && st.occupancy > 0) st.occupancy--;
+          int occ = st.occupancy; unlock_();
+          prefs.putInt("occ", occ);
+        } else {
+          raiseAlarm("FORCED_OPEN", "pintu terbuka tanpa akses sah");
+        }
       } else {
-        raiseAlarm("FORCED_OPEN", "pintu terbuka tanpa akses sah");
+        pushEvent("DOOR", "CLOSE", "", "", "", (int32_t)(millis() - doorOpenedAt));
+        lock(); bool leftAlarm = st.alarm && !strcmp(st.alarmType, "DOOR_LEFT_OPEN"); unlock_();
+        if (leftAlarm) clearAlarm("AUTO", "pintu ditutup");
       }
-    } else {                                       // ---- pintu DITUTUP (lidah miring mengunci otomatis)
-      pushEvent("DOOR", "CLOSE", "", "", "", (int32_t)(millis() - doorOpenedAt));
-      lock(); bool leftAlarm = st.alarm && !strcmp(st.alarmType, "DOOR_LEFT_OPEN"); unlock_();
-      if (leftAlarm) clearAlarm("AUTO", "pintu ditutup");
     }
   }
   // akses sah tapi pintu tidak dibuka dalam batas waktu -> batal
@@ -213,7 +229,7 @@ void serviceDoor() {
     if (pendingUid[0]) pushEvent("ACCESS", "BATAL", pendingDir, pendingUid, "pintu tidak dibuka");
   }
   // pintu lupa ditutup
-  if (stable && !leftOpenAlarmed && millis() - doorOpenedAt > cfg.leftOpenAlarmS * 1000UL) {
+  if (PIN_REED >= 0 && stable && !leftOpenAlarmed && millis() - doorOpenedAt > cfg.leftOpenAlarmS * 1000UL) {
     leftOpenAlarmed = true;
     lock(); bool other = st.alarm; unlock_();
     if (!other) { char d[40]; snprintf(d, sizeof d, "pintu terbuka > %lu dtk", (unsigned long)cfg.leftOpenAlarmS); raiseAlarm("DOOR_LEFT_OPEN", d); }
@@ -237,8 +253,8 @@ void checkReaders() {
   byte vIn = rfidIn.PCD_ReadRegister(MFRC522::VersionReg);
   byte vOut = rfidOut.PCD_ReadRegister(MFRC522::VersionReg);
   bool okIn = vIn != 0x00 && vIn != 0xFF, okOut = vOut != 0x00 && vOut != 0xFF;
-  if (!okIn) rfidIn.PCD_Init();
-  if (!okOut) rfidOut.PCD_Init();
+  if (!okIn)  { rfidIn.PCD_Init();  rfidIn.PCD_SetAntennaGain(MFRC522::RxGain_max); }
+  if (!okOut) { rfidOut.PCD_Init(); rfidOut.PCD_SetAntennaGain(MFRC522::RxGain_max); }
   lock(); bool ch = st.readerInOk != okIn || st.readerOutOk != okOut; st.readerInOk = okIn; st.readerOutOk = okOut; unlock_();
   if (ch) { markDirty(); pushEvent("SYSTEM", "READER", "", "", okIn && okOut ? "reader normal" : "reader RC522 tidak merespons"); }
 }
@@ -390,8 +406,8 @@ void netTask(void*) {
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_RELAY, OUTPUT); digitalWrite(PIN_RELAY, RELAY_ACTIVE_HIGH ? LOW : HIGH);  // kunci saat boot
-  pinMode(PIN_BUZZER, OUTPUT); digitalWrite(PIN_BUZZER, LOW);
-  pinMode(PIN_REED, INPUT_PULLUP);
+  if (PIN_BUZZER >= 0) { pinMode(PIN_BUZZER, OUTPUT); digitalWrite(PIN_BUZZER, LOW); }
+  if (PIN_REED >= 0) pinMode(PIN_REED, INPUT_PULLUP);
   if (PIN_LED_GREEN >= 0) pinMode(PIN_LED_GREEN, OUTPUT);
   if (PIN_LED_RED >= 0) pinMode(PIN_LED_RED, OUTPUT);
 
@@ -405,10 +421,12 @@ void setup() {
   whitelist = prefs.getString("wl", ",");
   if (prefs.getBytesLength("cfg") == sizeof(Config)) prefs.getBytes("cfg", &cfg, sizeof cfg);
   st.occupancy = prefs.getInt("occ", 0);
-  st.doorOpen = digitalRead(PIN_REED) == HIGH;
+  st.doorOpen = PIN_REED >= 0 && digitalRead(PIN_REED) == HIGH;
 
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI);
   rfidIn.PCD_Init(); rfidOut.PCD_Init();
+  rfidIn.PCD_SetAntennaGain(MFRC522::RxGain_max);    // jangkauan baca maksimal
+  rfidOut.PCD_SetAntennaGain(MFRC522::RxGain_max);
   Serial.printf("RC522 luar v%02X, dalam v%02X\n", rfidIn.PCD_ReadRegister(MFRC522::VersionReg), rfidOut.PCD_ReadRegister(MFRC522::VersionReg));
 
   WiFi.mode(WIFI_STA);
