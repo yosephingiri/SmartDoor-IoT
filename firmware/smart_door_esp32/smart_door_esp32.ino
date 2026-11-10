@@ -55,6 +55,10 @@ QueueHandle_t eventQ, cmdQ, ackQ;
 Config cfg;
 State st;
 String whitelist = ",";          // format ",UID1,UID2,"
+String inside = ",";             // UID yang tercatat di dalam ruangan, format sama (anti-passback)
+const uint32_t UNLOCK_MAX_MS = 15000;   // batas atas waktu solenoid aktif
+
+int countInside() { int n = -1; for (char c : inside) if (c == ',') n++; return n < 0 ? 0 : n; }
 volatile bool stateDirty = true;
 volatile bool forceSync = true;
 
@@ -146,7 +150,7 @@ void clearAlarm(const char* source, const char* detail) {
 void grantAccess(const char* dir, const char* uid) {
   authorizedPending = true;
   strlcpy(pendingDir, dir, sizeof pendingDir); strlcpy(pendingUid, uid, sizeof pendingUid);
-  uint32_t ms = cfg.unlockMs > 9000 ? 9000 : cfg.unlockMs;       // solenoid tidak boleh > 10 detik
+  uint32_t ms = cfg.unlockMs > UNLOCK_MAX_MS ? UNLOCK_MAX_MS : cfg.unlockMs;
   grantedUntil = millis() + ms;
   setRelay(true);
   setLed(PIN_LED_GREEN, true); lock(); st.ledGreen = true; unlock_();
@@ -176,8 +180,26 @@ void handleCard(MFRC522& reader, const char* dir) {
   if (blocked) return;
 
   if (ok) {
+    if (authorizedPending) {
+      if (uid == String(pendingUid)) return;   // kartu yang sama masih menempel, abaikan
+      pushEvent("ACCESS", "DITOLAK", dir, uid.c_str(), "menunggu akses sebelumnya selesai");
+      beep(BEEP_DENY, 5, BUZZER_FREQ_DENY);
+      setLed(PIN_LED_RED, true); ledRedUntil = millis() + 2000; lock(); st.ledRed = true; unlock_(); markDirty();
+      return;
+    }
+
+    // anti-passback: 1 tap = 1 orang. Kartu yang tercatat di dalam tidak bisa MASUK lagi,
+    // dan kartu yang tidak tercatat di dalam tidak bisa KELUAR.
+    bool diDalam = inside.indexOf("," + uid + ",") >= 0;
+    bool masuk = !strcmp(dir, "MASUK");
+    if (masuk == diDalam) {
+      pushEvent("ACCESS", "DITOLAK", dir, uid.c_str(), masuk ? "sudah tercatat di dalam" : "belum tercatat masuk");
+      beep(BEEP_DENY, 5, BUZZER_FREQ_DENY);
+      setLed(PIN_LED_RED, true); ledRedUntil = millis() + 2000; lock(); st.ledRed = true; unlock_(); markDirty();
+      return;
+    }
     lock(); st.failCount = 0; unlock_();
-    pushEvent("ACCESS", dir, dir, uid.c_str());
+    // event MASUK/KELUAR baru dikirim setelah pintu benar-benar dibuka (lihat serviceDoor)
     grantAccess(dir, uid.c_str());
   } else {
     lock(); st.failCount++; uint8_t f = st.failCount; unlock_(); markDirty();
@@ -207,11 +229,14 @@ void serviceDoor() {
         if (authorizedPending) {
           authorizedPending = false;
           endUnlockWindow();
-          lock();
-          if (!strcmp(pendingDir, "MASUK")) st.occupancy++;
-          else if (!strcmp(pendingDir, "KELUAR") && st.occupancy > 0) st.occupancy--;
-          int occ = st.occupancy; unlock_();
-          prefs.putInt("occ", occ);
+          if (pendingUid[0]) pushEvent("ACCESS", pendingDir, pendingDir, pendingUid);
+          String u = String(pendingUid);
+          if (u.length()) {
+            if (!strcmp(pendingDir, "MASUK") && inside.indexOf("," + u + ",") < 0) inside += u + ",";
+            else if (!strcmp(pendingDir, "KELUAR")) inside.replace("," + u + ",", ",");
+            prefs.putString("in", inside);
+          }
+          lock(); st.occupancy = countInside(); unlock_();
         } else {
           raiseAlarm("FORCED_OPEN", "pintu terbuka tanpa akses sah");
         }
@@ -246,15 +271,34 @@ void serviceDoor() {
   setLed(PIN_LED_RED, redOn); if (changed) markDirty();
 }
 
+void initReader(MFRC522& r) { r.PCD_Init(); r.PCD_SetAntennaGain(MFRC522::RxGain_max); }
+
+// Chip RC522 bisa ter-reset sendiri karena gangguan listrik (misalnya saat relay/solenoid bekerja).
+// Setelah reset, register versi tetap terbaca normal, tetapi antena mati dan TModeReg kembali 0x00,
+// sehingga kartu tidak terbaca. Kondisi ini dideteksi lalu reader diinisialisasi ulang otomatis.
+bool readerSiapBaca(MFRC522& r) {
+  return r.PCD_ReadRegister(MFRC522::TModeReg) == 0x80 &&               // nilai yang ditulis PCD_Init()
+         (r.PCD_ReadRegister(MFRC522::TxControlReg) & 0x03) == 0x03;     // antena menyala
+}
+
 void checkReaders() {
   static unsigned long t = 0;
-  if (millis() - t < 15000) return;
+  static bool logIn = false, logOut = false;   // agar pesan tidak berulang terus
+  if (millis() - t < 1000) return;             // cek tiap 1 detik
   t = millis();
   byte vIn = rfidIn.PCD_ReadRegister(MFRC522::VersionReg);
   byte vOut = rfidOut.PCD_ReadRegister(MFRC522::VersionReg);
   bool okIn = vIn != 0x00 && vIn != 0xFF, okOut = vOut != 0x00 && vOut != 0xFF;
-  if (!okIn)  { rfidIn.PCD_Init();  rfidIn.PCD_SetAntennaGain(MFRC522::RxGain_max); }
-  if (!okOut) { rfidOut.PCD_Init(); rfidOut.PCD_SetAntennaGain(MFRC522::RxGain_max); }
+  if (!okIn) initReader(rfidIn);
+  else if (!readerSiapBaca(rfidIn)) {
+    if (!logIn) Serial.println("[RFID] reader LUAR ter-reset -> inisialisasi ulang");
+    logIn = true; initReader(rfidIn);
+  } else logIn = false;
+  if (!okOut) initReader(rfidOut);
+  else if (!readerSiapBaca(rfidOut)) {
+    if (!logOut) Serial.println("[RFID] reader DALAM ter-reset -> inisialisasi ulang");
+    logOut = true; initReader(rfidOut);
+  } else logOut = false;
   lock(); bool ch = st.readerInOk != okIn || st.readerOutOk != okOut; st.readerInOk = okIn; st.readerOutOk = okOut; unlock_();
   if (ch) { markDirty(); pushEvent("SYSTEM", "READER", "", "", okIn && okOut ? "reader normal" : "reader RC522 tidak merespons"); }
 }
@@ -403,8 +447,13 @@ void netTask(void*) {
 }
 
 // ================================================================== SETUP / LOOP (core 1)
+// Penanda build: waktu compile, untuk memastikan firmware yang berjalan adalah hasil upload terbaru.
+const char BUILD_INFO[] = FW_VERSION " " __DATE__ " " __TIME__;
+
 void setup() {
   Serial.begin(115200);
+  delay(500);
+  Serial.printf("\n===== SMART DOOR | anti-passback | build %s =====\n", BUILD_INFO);
   pinMode(PIN_RELAY, OUTPUT); digitalWrite(PIN_RELAY, RELAY_ACTIVE_HIGH ? LOW : HIGH);  // kunci saat boot
   if (PIN_BUZZER >= 0) { pinMode(PIN_BUZZER, OUTPUT); digitalWrite(PIN_BUZZER, LOW); }
   if (PIN_REED >= 0) pinMode(PIN_REED, INPUT_PULLUP);
@@ -420,7 +469,8 @@ void setup() {
   prefs.begin("smartdoor", false);
   whitelist = prefs.getString("wl", ",");
   if (prefs.getBytesLength("cfg") == sizeof(Config)) prefs.getBytes("cfg", &cfg, sizeof cfg);
-  st.occupancy = prefs.getInt("occ", 0);
+  inside = prefs.getString("in", ",");
+  st.occupancy = countInside();
   st.doorOpen = PIN_REED >= 0 && digitalRead(PIN_REED) == HIGH;
 
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI);
@@ -434,7 +484,7 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   configTime(0, 0, "pool.ntp.org", "time.google.com");   // simpan UTC; dashboard menampilkan WIB
 
-  pushEvent("SYSTEM", "BOOT", "", "", FW_VERSION);
+  pushEvent("SYSTEM", "BOOT", "", "", BUILD_INFO);
   xTaskCreatePinnedToCore(netTask, "net", 12288, nullptr, 1, nullptr, 0);
   Serial.printf("Smart Door %s siap. Whitelist offline: %d byte\n", DEVICE_ID, whitelist.length());
 }
